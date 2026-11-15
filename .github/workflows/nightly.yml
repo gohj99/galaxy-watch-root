@@ -1,0 +1,276 @@
+name: Discover and build watch boot images
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      device:
+        description: Device configuration directory name
+        required: true
+        default: sm-l315f
+      source_urls:
+        description: Comma-separated Samsung source archive URLs (optional override)
+        required: false
+        type: string
+      base_boot_url:
+        description: URL of the known-good boot template (optional override)
+        required: false
+        type: string
+      base_boot_sha256:
+        description: SHA-256 of the boot template (optional override)
+        required: false
+        type: string
+      force:
+        description: Build even when the release tag already exists
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: watch-root-${{ github.event.inputs.device || 'sm-l315f' }}
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    outputs:
+      device: ${{ steps.resolve.outputs.device }}
+      source_urls: ${{ steps.resolve.outputs.source_urls }}
+      base_boot_url: ${{ steps.resolve.outputs.base_boot_url }}
+      base_boot_sha256: ${{ steps.resolve.outputs.base_boot_sha256 }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Discover Samsung Open Source metadata
+        id: samsung
+        continue-on-error: true
+        env:
+          DEVICE: ${{ github.event.inputs.device || 'sm-l315f' }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          d = os.environ['DEVICE']
+          cfg = json.loads(Path(f'devices/{d}/device.json').read_text())
+          Path('discovery-device.json').write_text(json.dumps(cfg, indent=2))
+          PY
+          python3 scripts/discover_samsung.py \
+            --query "$(python3 -c "import json; print(json.load(open('discovery-device.json'))['source_search'])")" \
+            --model "$(python3 -c "import json; print(json.load(open('discovery-device.json'))['model'])")" \
+            --output samsung-discovery.json
+      - name: Resolve configured inputs
+        id: resolve
+        env:
+          DEVICE_INPUT: ${{ github.event.inputs.device || 'sm-l315f' }}
+          SOURCE_INPUT: ${{ github.event.inputs.source_urls || '' }}
+          BASE_INPUT: ${{ github.event.inputs.base_boot_url || '' }}
+          BASE_SHA_INPUT: ${{ github.event.inputs.base_boot_sha256 || '' }}
+          FORCE_INPUT: ${{ github.event.inputs.force || 'false' }}
+          DISCOVERY_OK: ${{ steps.samsung.outcome == 'success' }}
+          AVB_PRIVATE_KEY_B64: ${{ secrets.AVB_PRIVATE_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          device = os.environ['DEVICE_INPUT']
+          cfg = json.loads(Path(f'devices/{device}/device.json').read_text())
+          sources = [x for x in os.environ['SOURCE_INPUT'].split(',') if x]
+          if not sources:
+              sources = [x.get('url', '') if isinstance(x, dict) else x for x in cfg.get('source_archives', [])]
+              sources = [x for x in sources if x]
+          base = os.environ['BASE_INPUT'] or cfg.get('base_boot', {}).get('url', '')
+          base_sha = os.environ['BASE_SHA_INPUT'] or cfg.get('base_boot', {}).get('sha256', '')
+          # A manual URL override is an explicit acknowledgement that the
+          # caller accepted Samsung's download terms. Scheduled builds must
+          # have a successful metadata check before publishing anything.
+          discovery_ok = os.environ['DISCOVERY_OK'].lower() == 'true'
+          explicit_sources = bool(os.environ['SOURCE_INPUT'])
+          latest_id = ''
+          discovery_path = Path('samsung-discovery.json')
+          if discovery_path.is_file():
+              discovered = json.loads(discovery_path.read_text())
+              latest_id = str(discovered.get('selected', {}).get('upload_id', ''))
+          pinned_id = str(cfg.get('samsung_upload_id', ''))
+          new_source_waiting = bool(discovery_ok and pinned_id and latest_id and latest_id != pinned_id and not explicit_sources)
+          ready = bool(sources and base and os.environ['AVB_PRIVATE_KEY_B64']) and (discovery_ok or explicit_sources) and not new_source_waiting
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'device={device}\n')
+              out.write('source_urls=' + ','.join(sources) + '\n')
+              out.write(f'base_boot_url={base}\n')
+              out.write(f'base_boot_sha256={base_sha}\n')
+              out.write(f'should_build={str(ready).lower()}\n')
+          if not ready:
+              if new_source_waiting:
+                  print(f'Samsung first matching upload {latest_id} differs from pinned upload {pinned_id}; review the source version and test compatibility, then rerun.')
+              else:
+                  print('Build is disabled until Samsung metadata succeeds (or manual source URLs are supplied), source archive URLs, base_boot.url, and AVB_PRIVATE_KEY_B64 are configured.')
+          PY
+      - name: Upload discovery metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: samsung-discovery-${{ github.run_id }}
+          path: |
+            samsung-discovery.json
+            discovery-device.json
+          if-no-files-found: ignore
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      DEVICE: ${{ needs.discover.outputs.device }}
+      WORK: ${{ github.workspace }}/work
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential cpio dwarves flex gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi libelf-dev libssl-dev lz4 rsync unzip xz-utils
+      - name: Read device configuration
+        id: cfg
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          cfg = json.loads(Path(f'devices/{os.environ["DEVICE"]}/device.json').read_text())
+          out = os.environ['GITHUB_OUTPUT']
+          with open(out, 'a') as f:
+              f.write('toolchain_url=' + cfg['toolchain']['url'] + '\n')
+              f.write('toolchain_sha256=' + cfg['toolchain'].get('sha256', '') + '\n')
+              f.write('bakasu_commit=' + cfg['bakasu_commit'] + '\n')
+              f.write('jobs=' + str(cfg['build'].get('jobs', 4)) + '\n')
+              f.write('branch=' + cfg['build'].get('branch', '') + '\n')
+              f.write('kmi_generation=' + str(cfg['build'].get('kmi_generation', '')) + '\n')
+              f.write('target_build_variant=' + cfg['build'].get('target_build_variant', 'user') + '\n')
+              f.write('target_soc=' + cfg['build'].get('target_soc', '') + '\n')
+              f.write('target_product=' + cfg['build'].get('target_product', '') + '\n')
+              f.write('kernel_release_suffix=' + cfg['build'].get('kernel_release_suffix', '') + '\n')
+              f.write('asset_prefix=' + cfg['release']['asset_prefix'] + '\n')
+              f.write('partition_size=' + str(cfg['base_boot'].get('partition_size', 67108864)) + '\n')
+          Path('work/overrides.json').parent.mkdir(parents=True, exist_ok=True)
+          Path('work/overrides.json').write_text(json.dumps(cfg['build']['overrides']))
+          PY
+      - name: Download toolchain
+        run: |
+          mkdir -p "$WORK/toolchain"
+          curl --fail --location --retry 3 "${{ steps.cfg.outputs.toolchain_url }}" -o "$WORK/clang.tar.gz"
+          if [ -n "${{ steps.cfg.outputs.toolchain_sha256 }}" ]; then
+            echo "${{ steps.cfg.outputs.toolchain_sha256 }}  $WORK/clang.tar.gz" | sha256sum -c -
+          fi
+          tar -xzf "$WORK/clang.tar.gz" -C "$WORK/toolchain"
+      - name: Fetch Samsung source archives
+        env:
+          SOURCES: ${{ needs.discover.outputs.source_urls }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK/src"
+          IFS=',' read -ra source_list <<< "$SOURCES"
+          args=()
+          for source in "${source_list[@]}"; do args+=(--archive "$source"); done
+          python3 scripts/fetch_source.py --output "$WORK/src/kernel" \
+            --manifest "$WORK/source-manifest.json" "${args[@]}"
+      - name: Prepare BakaSU kernel
+        run: |
+          export PATH="$WORK/toolchain/bin:$PATH"
+          python3 scripts/prepare_kernel.py \
+            --source "$WORK/src/kernel" \
+            --config "devices/$DEVICE/kernel.config" \
+            --certificate "devices/$DEVICE/stock-gki.pem" \
+            --output "$WORK/out" \
+            --manifest "$WORK/kernel-manifest.json" \
+            --overrides "$WORK/overrides.json" \
+            --bakasu-commit "${{ steps.cfg.outputs.bakasu_commit }}"
+      - name: Compile kernel Image
+        env:
+          BRANCH: ${{ steps.cfg.outputs.branch }}
+          KMI_GENERATION: ${{ steps.cfg.outputs.kmi_generation }}
+          TARGET_BUILD_VARIANT: ${{ steps.cfg.outputs.target_build_variant }}
+          TARGET_SOC: ${{ steps.cfg.outputs.target_soc }}
+          TARGET_PRODUCT: ${{ steps.cfg.outputs.target_product }}
+          KERNEL_RELEASE_SUFFIX: ${{ steps.cfg.outputs.kernel_release_suffix }}
+        run: bash scripts/build_kernel.sh "$WORK/src/kernel" "$WORK/out" "$WORK/toolchain" "${{ steps.cfg.outputs.jobs }}"
+      - name: Download boot template
+        run: |
+          curl --fail --location --retry 3 "${{ needs.discover.outputs.base_boot_url }}" -o "$WORK/base-boot.img"
+          expected='${{ needs.discover.outputs.base_boot_sha256 }}'
+          if [ -n "$expected" ]; then echo "$expected  $WORK/base-boot.img" | sha256sum -c -; fi
+      - name: Sign boot image
+        env:
+          AVB_PRIVATE_KEY_B64: ${{ secrets.AVB_PRIVATE_KEY_B64 }}
+        run: |
+          printf '%s' "$AVB_PRIVATE_KEY_B64" | base64 --decode > "$WORK/avb.pem"
+          python3 scripts/build_boot.py \
+            --base "$WORK/base-boot.img" \
+            --kernel "$WORK/out/arch/arm64/boot/Image" \
+            --avbtool scripts/avbtool.py \
+            --key "$WORK/avb.pem" \
+            --output "$WORK/boot.img" \
+            --manifest "$WORK/boot-manifest.json" \
+            --partition-size "${{ steps.cfg.outputs.partition_size }}"
+          python3 scripts/avbtool.py verify_image \
+            --image "$WORK/boot.img" \
+            --key "$WORK/avb.pem"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source_hash=$(sha256sum "$WORK/out/arch/arm64/boot/Image" | cut -c1-12)
+          tag="${{ steps.cfg.outputs.asset_prefix }}-${source_hash}"
+          if gh release view "$tag" >/dev/null 2>&1 && [ "${{ github.event.inputs.force || 'false' }}" != "true" ]; then
+            echo "Release $tag already exists; source output is unchanged."
+            exit 0
+          fi
+          asset="${{ steps.cfg.outputs.asset_prefix }}-${source_hash}.img"
+          cp "$WORK/boot.img" "$asset"
+          notes_file=$(mktemp)
+          cat > "$notes_file" <<EOF
+          Automated BakaSU boot build for $DEVICE.
+
+          Only the signed boot image is published. The device must be unlocked and
+          the boot chain must accept the local AVB key. Static checks do not prove
+          device boot or root.
+          EOF
+          if gh release view "$tag" >/dev/null 2>&1; then
+            if [ "${{ github.event.inputs.force || 'false' }}" != "true" ]; then
+              echo "Release $tag already exists; source output is unchanged."
+              rm -f "$notes_file"
+              exit 0
+            fi
+            gh release upload "$tag" "$asset" --clobber
+            gh release edit "$tag" --title "$tag" --notes-file "$notes_file"
+          else
+            gh release create "$tag" "$asset" --title "$tag" --notes-file "$notes_file" --target "$GITHUB_SHA"
+          fi
+          rm -f "$notes_file"
+      - name: Remove temporary signing key
+        if: always()
+        run: rm -f "$WORK/avb.pem" "$WORK/base-boot.img"
+      - name: Collect build reports
+        if: always()
+        run: |
+          mkdir -p reports
+          cp "$WORK"/*manifest.json reports/ 2>/dev/null || true
+          cp "$WORK/out/Image.sha256" "$WORK/out/kernelrelease" reports/ 2>/dev/null || true
+      - name: Upload build reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ github.run_id }}
+          path: reports/
+          if-no-files-found: ignore

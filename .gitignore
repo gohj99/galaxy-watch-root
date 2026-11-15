@@ -1,0 +1,21 @@
+# Build output and downloaded source archives
+.cache/
+work/
+out/
+release/
+*.img
+*.tar
+*.tar.gz
+*.zip
+__pycache__/
+*.pyc
+.venv*/
+*.tar.md5
+
+# Local signing material. Store the private key in GitHub Actions secrets.
+*.pem
+*.key
+*.avbpubkey
+devices/*/base-boot.img
+!devices/*/stock-gki.pem
+

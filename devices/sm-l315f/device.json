@@ -1,0 +1,64 @@
+{
+  "id": "sm-l315f",
+  "family": "galaxy-watch7",
+  "model": "SM-L315F",
+  "source_search": "SM-L315",
+  "samsung_upload_id": "14120",
+  "kernel_release": "6.1.134-android14-11",
+  "kernel_config": "devices/sm-l315f/kernel.config",
+  "stock_gki_certificate": "devices/sm-l315f/stock-gki.pem",
+  "bakasu_commit": "548d1dda060ca198823d8808804d01f5209ef4a9",
+  "base_boot": {
+    "sha256": "153400e7c782a71836a63d4c5bb9ab14ead163fedf2036546e170bbb8bd7c3f0",
+    "partition_size": 67108864,
+    "url": "",
+    "note": "Set an immutable URL for the known-good signed boot before enabling builds. It can be a matching device Release asset. It may be extracted once from AP or dumped from the matching rooted device; the full firmware is not needed by this workflow."
+  },
+  "toolchain": {
+    "url": "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz",
+    "sha256": "b1963686f4d49e83d3df32c1c8575a09180bab3bb7dd09cbab3ac2d9cf5ee43f"
+  },
+  "source_archives": [
+    {
+      "filename": "SM-L305U_Opensource.zip",
+      "url": ""
+    },
+    {
+      "filename": "SM-L315F_EUR_Opensource_dts.zip",
+      "url": ""
+    },
+    {
+      "filename": "SM-L305U_Opensource_L305USQS3BZF4_L300XXS2BZF4_L300ZCS2BZF4_L305FXXS3BZF4_L305NKOS3BZF4_L310XXS2BZF4_L310ZCS2BZF4_L3150ZCS3BZF4_L315FXXS3BZF4_L315NKOS3BZF4_L315USQS3BZF4.zip",
+      "url": ""
+    }
+  ],
+  "build": {
+    "arch": "arm64",
+    "llvm": true,
+    "branch": "android14-6.1",
+    "kmi_generation": "11",
+    "target_build_variant": "user",
+    "target_soc": "s5e5535",
+    "target_product": "fresh7ulxx",
+    "kernel_release_suffix": "-android14-11",
+    "jobs": 4,
+    "overrides": {
+      "KSU": "y",
+      "KSU_TRACEPOINT_HOOK": "y",
+      "KSU_MULTI_MANAGER_SUPPORT": "y",
+      "KSU_MANUAL_HOOK": "n",
+      "KSU_SUSFS": "n",
+      "UH": "n",
+      "RKP": "n",
+      "KDP": "n",
+      "KDP_CRED": "n",
+      "SECURITY_DEFEX": "n",
+      "SECURITY_DEFEX_USER": "n",
+      "SECURITY_DEFEX_SINGLE_FILE": "n",
+      "SYSTEM_TRUSTED_KEYS": "certs/gw7-stock-gki.pem"
+    }
+  },
+  "release": {
+    "asset_prefix": "galaxy-watch7-SM-L315F"
+  }
+}
